@@ -998,6 +998,28 @@ void InitPadLayout(TouchControlConfig *config, DeviceOrientation orientation, fl
 	}
 }
 
+// ===== Mode Diva : 4 zones tactiles rectangulaires en bas de l'ecran =====
+class DivaZone : public PSPButton {
+public:
+	DivaZone(int bit, std::string_view key, ImageID symbol, uint32_t color, UI::LayoutParams *lp)
+		: PSPButton(bit, key, ImageID("I_RECT"), ImageID("I_RECT"), symbol, 1.0f, lp), symbol_(symbol), color_(color) {}
+	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override { w = 0.0f; h = 0.0f; }
+	void Draw(UIContext &dc) override {
+		const float a = std::max(g_gamepadOpacity, 0.2f);
+		const bool down = IsDownByTouch();
+		dc.Draw()->Rect(bounds_.x, bounds_.y, bounds_.w, bounds_.h, colorAlpha(color_, a * (down ? 0.9f : 0.35f)));
+		dc.Draw()->RectOutline(bounds_.x, bounds_.y, bounds_.w, bounds_.h, colorAlpha(0xFFFFFF, a));
+		const AtlasImage *img = dc.Draw()->GetAtlas()->getImage(symbol_);
+		if (img) {
+			float s = 0.5f * std::min(bounds_.w, bounds_.h) / std::max(img->w, img->h);
+			dc.Draw()->DrawImageRotated(symbol_, bounds_.centerX(), bounds_.centerY(), s, 0.0f, colorAlpha(0xFFFFFF, a));
+		}
+	}
+private:
+	ImageID symbol_;
+	uint32_t color_;
+};
+
 UI::ViewGroup *CreatePadLayout(const TouchControlConfig &config, float xres, float yres, bool *pause, ControlMapper *controlMapper) {
 	using namespace UI;
 	return new GamepadEmuView(config, xres, yres, pause, controlMapper, new UI::LayoutParams(UI::FILL_PARENT, UI::FILL_PARENT));
@@ -1073,14 +1095,32 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 		}
 	}
 
+	// Mode Diva : actif en paysage. Jeu = 60% du haut, boutons = 40% du bas.
+	const bool divaMode = xres > yres;
+	if (divaMode) {
+		const float zoneTop = yres * 0.6f;
+		const float zoneH = yres - zoneTop;
+		const float zoneW = xres / 4.0f;
+		struct { int bit; const char *key; const char *img; uint32_t color; } zones[4] = {
+			{ CTRL_TRIANGLE, "Diva triangle", "I_TRIANGLE", 0x60D040 },
+			{ CTRL_SQUARE,   "Diva square",   "I_SQUARE",   0xC060FF },
+			{ CTRL_CROSS,    "Diva cross",    "I_CROSS",    0xFF9040 },
+			{ CTRL_CIRCLE,   "Diva circle",   "I_CIRCLE",   0x4040FF },
+		};
+		for (int i = 0; i < 4; i++) {
+			Add(new DivaZone(zones[i].bit, zones[i].key, ImageID(zones[i].img), zones[i].color,
+				new AnchorLayoutParams(zoneW, zoneH, zoneW * i, zoneTop, NONE, NONE)));
+		}
+	}
+
 	// touchActionButtonCenter.show will always be true, since that's the default.
-	if (config.bShowTouchCircle)
+	if (config.bShowTouchCircle && !divaMode)
 		addPSPButton(CTRL_CIRCLE, "Circle button", roundImage, ImageID("I_ROUND"), ImageID("I_CIRCLE"), config.touchActionButtonCenter, circleOffset);
-	if (config.bShowTouchCross)
+	if (config.bShowTouchCross && !divaMode)
 		addPSPButton(CTRL_CROSS, "Cross button", roundImage, ImageID("I_ROUND"), ImageID("I_CROSS"), config.touchActionButtonCenter, crossOffset);
-	if (config.bShowTouchTriangle)
+	if (config.bShowTouchTriangle && !divaMode)
 		addPSPButton(CTRL_TRIANGLE, "Triangle button", roundImage, ImageID("I_ROUND"), ImageID("I_TRIANGLE"), config.touchActionButtonCenter, triangleOffset);
-	if (config.bShowTouchSquare)
+	if (config.bShowTouchSquare && !divaMode)
 		addPSPButton(CTRL_SQUARE, "Square button", roundImage, ImageID("I_ROUND"), ImageID("I_SQUARE"), config.touchActionButtonCenter, squareOffset);
 
 	addPSPButton(CTRL_START, "Start button", rectImage, ImageID("I_RECT"), ImageID("I_START"), config.touchStartKey);
@@ -1122,7 +1162,8 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 
 		char temp[64];
 		snprintf(temp, sizeof(temp), "Custom %d button", i + 1);
-		addCustomButton(g_Config.CustomButton[i], temp, config.touchCustom[i]);
+		if (!divaMode)
+			addCustomButton(g_Config.CustomButton[i], temp, config.touchCustom[i]);
 	}
 
 	// Add the two gesture zones.
