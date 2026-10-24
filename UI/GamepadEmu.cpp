@@ -998,26 +998,27 @@ void InitPadLayout(TouchControlConfig *config, DeviceOrientation orientation, fl
 	}
 }
 
-// ===== Mode Diva : 4 zones tactiles rectangulaires en bas de l'ecran =====
+// ===== Mode Diva : zones tactiles rectangulaires =====
 class DivaZone : public PSPButton {
 public:
-	DivaZone(int bit, std::string_view key, ImageID symbol, uint32_t color, UI::LayoutParams *lp)
-		: PSPButton(bit, key, ImageID("I_RECT"), ImageID("I_RECT"), symbol, 1.0f, lp), symbol_(symbol), color_(color) {}
+	DivaZone(int bit, std::string_view key, ImageID symbol, uint32_t color, float angle, UI::LayoutParams *lp)
+		: PSPButton(bit, key, ImageID("I_RECT"), ImageID("I_RECT"), symbol, 1.0f, lp), symbol_(symbol), color_(color), angle_(angle) {}
 	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override { w = 0.0f; h = 0.0f; }
 	void Draw(UIContext &dc) override {
 		const float a = std::max(g_gamepadOpacity, 0.2f);
 		const bool down = IsDownByTouch();
-		dc.Draw()->Rect(bounds_.x, bounds_.y, bounds_.w, bounds_.h, colorAlpha(color_, a * (down ? 0.9f : 0.35f)));
-		dc.Draw()->RectOutline(bounds_.x, bounds_.y, bounds_.w, bounds_.h, colorAlpha(0xFFFFFF, a));
+		Bounds inner(bounds_.x + 2.0f, bounds_.y + 2.0f, bounds_.w - 4.0f, bounds_.h - 4.0f);
+		dc.FillRect(UI::Drawable(colorAlpha(color_, a * (down ? 0.9f : 0.45f))), inner);
 		const AtlasImage *img = dc.Draw()->GetAtlas()->getImage(symbol_);
 		if (img) {
 			float s = 0.5f * std::min(bounds_.w, bounds_.h) / std::max(img->w, img->h);
-			dc.Draw()->DrawImageRotated(symbol_, bounds_.centerX(), bounds_.centerY(), s, 0.0f, colorAlpha(0xFFFFFF, a));
+			dc.Draw()->DrawImageRotated(symbol_, bounds_.centerX(), bounds_.centerY(), s, angle_, colorAlpha(0xFFFFFF, a));
 		}
 	}
 private:
 	ImageID symbol_;
 	uint32_t color_;
+	float angle_;
 };
 
 UI::ViewGroup *CreatePadLayout(const TouchControlConfig &config, float xres, float yres, bool *pause, ControlMapper *controlMapper) {
@@ -1095,21 +1096,41 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 		}
 	}
 
-	// Mode Diva : actif en paysage. Jeu = 60% du haut, boutons = 40% du bas.
+	// Mode Diva (paysage) : jeu en haut au centre (60% de la hauteur),
+	// 2 fleches a gauche, 2 fleches a droite, 4 boutons sur les 40% du bas.
 	const bool divaMode = xres > yres;
 	if (divaMode) {
-		const float zoneTop = yres * 0.6f;
-		const float zoneH = yres - zoneTop;
-		const float zoneW = xres / 4.0f;
-		struct { int bit; const char *key; const char *img; uint32_t color; } zones[4] = {
-			{ CTRL_TRIANGLE, "Diva triangle", "I_TRIANGLE", 0x60D040 },
-			{ CTRL_SQUARE,   "Diva square",   "I_SQUARE",   0xC060FF },
-			{ CTRL_CROSS,    "Diva cross",    "I_CROSS",    0xFF9040 },
-			{ CTRL_CIRCLE,   "Diva circle",   "I_CIRCLE",   0x4040FF },
+		// Coordonnees ecran complet (on ignore les marges de l'encoche).
+		const float fullW = (float)g_display.dp_xres;
+		const float fullH = (float)g_display.dp_yres;
+		const float ox = (xres - fullW) * 0.5f;
+		const float oy = (yres - fullH) * 0.5f;
+		const float gameH = fullH * 0.6f;
+		const float gameW = gameH * 480.0f / 272.0f;
+		const float padW = std::max((fullW - gameW) * 0.5f, 0.0f);
+		const float padH = gameH * 0.5f;
+		const float btnH = fullH - gameH;
+		const float btnW = fullW / 4.0f;
+		struct Zone { int bit; const char *key; const char *img; uint32_t color; float angle; float x; float y; };
+		const Zone pad[4] = {
+			{ CTRL_RIGHT, "Diva right", "I_ARROW", 0x4040FF, (float)M_PI,         0.0f,         0.0f },
+			{ CTRL_DOWN,  "Diva down",  "I_ARROW", 0xFF9040, (float)(M_PI * 1.5), 0.0f,         padH },
+			{ CTRL_UP,    "Diva up",    "I_ARROW", 0x60D040, (float)(M_PI * 0.5), fullW - padW, 0.0f },
+			{ CTRL_LEFT,  "Diva left",  "I_ARROW", 0xC060FF, 0.0f,                fullW - padW, padH },
+		};
+		const Zone btn[4] = {
+			{ CTRL_TRIANGLE, "Diva triangle", "I_TRIANGLE", 0x60D040, 0.0f, 0.0f, 0.0f },
+			{ CTRL_SQUARE,   "Diva square",   "I_SQUARE",   0xC060FF, 0.0f, 0.0f, 0.0f },
+			{ CTRL_CROSS,    "Diva cross",    "I_CROSS",    0xFF9040, 0.0f, 0.0f, 0.0f },
+			{ CTRL_CIRCLE,   "Diva circle",   "I_CIRCLE",   0x4040FF, 0.0f, 0.0f, 0.0f },
 		};
 		for (int i = 0; i < 4; i++) {
-			Add(new DivaZone(zones[i].bit, zones[i].key, ImageID(zones[i].img), zones[i].color,
-				new AnchorLayoutParams(zoneW, zoneH, zoneW * i, zoneTop, NONE, NONE)));
+			if (padW > 0.0f) {
+				Add(new DivaZone(pad[i].bit, pad[i].key, ImageID(pad[i].img), pad[i].color, pad[i].angle,
+					new AnchorLayoutParams(padW, padH, ox + pad[i].x, oy + pad[i].y, NONE, NONE)));
+			}
+			Add(new DivaZone(btn[i].bit, btn[i].key, ImageID(btn[i].img), btn[i].color, btn[i].angle,
+				new AnchorLayoutParams(btnW, btnH, ox + btnW * i, oy + gameH, NONE, NONE)));
 		}
 	}
 
@@ -1141,7 +1162,7 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 	if (rTrigger)
 		rTrigger->FlipImageH(true);
 
-	if (config.touchDpad.show) {
+	if (config.touchDpad.show && !divaMode) {
 		const ImageID dirImage = g_Config.iTouchButtonStyle ? ImageID("I_DIR_LINE") : ImageID("I_DIR");
 		Add(new PSPDpad(dirImage, "D-pad", ImageID("I_DIR"), ImageID("I_ARROW"), config.touchDpad.scale, config.fDpadSpacing, buttonLayoutParams(config.touchDpad)));
 	}
