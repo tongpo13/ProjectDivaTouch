@@ -1096,8 +1096,8 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 		}
 	}
 
-	// Mode Diva (paysage) : jeu en haut au centre (60% de la hauteur),
-	// 2 fleches a gauche, 2 fleches a droite, 4 boutons sur les 40% du bas.
+	// Mode Diva (paysage) : jeu en haut au centre (70% de la hauteur),
+	// 2 fleches a gauche, 2 fleches a droite, 4 boutons sur les 30% du bas.
 	const bool divaMode = xres > yres;
 	if (divaMode) {
 		// Coordonnees ecran complet (on ignore les marges de l'encoche).
@@ -1105,7 +1105,7 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 		const float fullH = (float)g_display.dp_yres;
 		const float ox = (xres - fullW) * 0.5f;
 		const float oy = (yres - fullH) * 0.5f;
-		const float gameH = fullH * 0.6f;
+		const float gameH = fullH * 0.70f;
 		const float gameW = gameH * 480.0f / 272.0f;
 		const float padW = std::max((fullW - gameW) * 0.5f, 0.0f);
 		const float padH = gameH * 0.5f;
