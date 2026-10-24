@@ -226,9 +226,9 @@ void CalculateDisplayOutputRect(const DisplayLayoutConfig &config, FRect *rc, fl
 		rc->h = floorf(outH);
 	}
 
-	// ===== Mode Diva : en paysage, jeu en haut au centre, 60% de la hauteur =====
+	// ===== Mode Diva : en paysage, jeu en haut au centre, 70% de la hauteur =====
 	if (!IsVREnabled() && !inOverlayHole && !rotated && outputOrientation == DeviceOrientation::Landscape && origW == 480.0f && origH == 272.0f) {
-		const float h = screenFrame.h * 0.6f;
+		const float h = screenFrame.h * 0.70f;
 		const float w = h * 480.0f / 272.0f;
 		rc->x = floorf(screenFrame.x + (screenFrame.w - w) * 0.5f);
 		rc->y = floorf(screenFrame.y);
