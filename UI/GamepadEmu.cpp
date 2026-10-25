@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
+#include <mutex>
 
 #include "Common/Data/Color/RGBAUtil.h"
 #include "Common/Data/Text/I18n.h"
@@ -998,88 +999,278 @@ void InitPadLayout(TouchControlConfig *config, DeviceOrientation orientation, fl
 	}
 }
 
-// ===== Mode Diva : zones tactiles rectangulaires =====
-class DivaArrowZone;
+// ===== Mode Diva : entree directe =====
+// Les appuis sont traites des leur arrivee (thread d'entree Android), sans attendre
+// le traitement de la file d'evenements au debut de l'image suivante.
+// Les vues ci-dessous ne font que dessiner et donner leur position.
+namespace DivaFast {
 
-class DivaZone : public PSPButton {
+enum { FACE_COUNT = 4, ARROW_COUNT = 2, ZONE_NONE = -1, ZONE_ARROW_BASE = 10 };
+
+struct Rect {
+	float x = 0, y = 0, w = 0, h = 0;
+	bool Contains(float px, float py) const { return w > 0 && px >= x && px < x + w && py >= y && py < y + h; }
+};
+
+struct ArrowCfg { int pairFace; int otherFace; int pairDir; int fallbackDir; };
+
+static std::mutex g_lock;
+static bool g_enabled = false;
+static double g_lastTick = 0.0;
+static Rect g_faceRect[FACE_COUNT];
+static int g_faceBit[FACE_COUNT];
+static Rect g_arrowRect[ARROW_COUNT];
+static ArrowCfg g_arrowCfg[ARROW_COUNT];
+static int g_arrowCount = 0;
+static Rect g_swipeRect;
+
+static bool g_ptrDown[TOUCH_MAX_POINTERS];
+static int g_ptrZone[TOUCH_MAX_POINTERS];
+static bool g_swipeActive[TOUCH_MAX_POINTERS];
+static bool g_swipeFired[TOUCH_MAX_POINTERS];
+static float g_swipeStartX[TOUCH_MAX_POINTERS];
+
+static bool g_faceDown[FACE_COUNT];
+static bool g_arrowDown[ARROW_COUNT];
+static int g_arrowSent[ARROW_COUNT];
+static double g_arrowDownTime[ARROW_COUNT];
+static int g_swipePressed = 0;
+static double g_swipeTime = 0.0;
+static uint32_t g_sentMask = 0;
+
+static const double kGraceSeconds = 0.06;  // temps laisse pour poser le 2e doigt
+static const double kSwipeHoldSeconds = 0.08;
+static const double kActiveTimeout = 0.25;  // plus d'image de jeu depuis ce temps = pause/menu
+
+static void ApplyLocked(uint32_t mask) {
+	uint32_t set = mask & ~g_sentMask;
+	uint32_t clear = g_sentMask & ~mask;
+	if (set || clear)
+		__CtrlUpdateButtons(set, clear);
+	g_sentMask = mask;
+}
+
+static void ResetLocked() {
+	for (int i = 0; i < TOUCH_MAX_POINTERS; i++) {
+		g_ptrDown[i] = false;
+		g_ptrZone[i] = ZONE_NONE;
+		g_swipeActive[i] = false;
+		g_swipeFired[i] = false;
+	}
+	for (int i = 0; i < FACE_COUNT; i++)
+		g_faceDown[i] = false;
+	for (int i = 0; i < ARROW_COUNT; i++) {
+		g_arrowDown[i] = false;
+		g_arrowSent[i] = 0;
+	}
+	g_swipePressed = 0;
+	ApplyLocked(0);
+}
+
+static int ZoneAtLocked(float x, float y) {
+	for (int i = 0; i < FACE_COUNT; i++)
+		if (g_faceRect[i].Contains(x, y))
+			return i;
+	for (int i = 0; i < g_arrowCount; i++)
+		if (g_arrowRect[i].Contains(x, y))
+			return ZONE_ARROW_BASE + i;
+	return ZONE_NONE;
+}
+
+static void RecomputeLocked(double now) {
+	for (int i = 0; i < FACE_COUNT; i++)
+		g_faceDown[i] = false;
+	bool arrowDownNow[ARROW_COUNT] = {};
+	for (int p = 0; p < TOUCH_MAX_POINTERS; p++) {
+		if (!g_ptrDown[p])
+			continue;
+		const int z = g_ptrZone[p];
+		if (z >= 0 && z < FACE_COUNT)
+			g_faceDown[z] = true;
+		else if (z >= ZONE_ARROW_BASE && z < ZONE_ARROW_BASE + g_arrowCount)
+			arrowDownNow[z - ZONE_ARROW_BASE] = true;
+	}
+
+	uint32_t mask = 0;
+	for (int i = 0; i < FACE_COUNT; i++)
+		if (g_faceDown[i])
+			mask |= g_faceBit[i];
+
+	for (int a = 0; a < g_arrowCount; a++) {
+		const ArrowCfg &c = g_arrowCfg[a];
+		if (!arrowDownNow[a]) {
+			g_arrowDown[a] = false;
+			g_arrowSent[a] = 0;
+			continue;
+		}
+		if (!g_arrowDown[a]) {
+			g_arrowDown[a] = true;
+			g_arrowDownTime[a] = now;
+		}
+		int want = g_arrowSent[a];
+		if (g_faceDown[c.pairFace] || g_arrowSent[a] == c.pairDir) {
+			want = c.pairDir;  // la combinaison reste prioritaire tant que le doigt est pose
+		} else if (g_faceDown[c.otherFace] || now - g_arrowDownTime[a] >= kGraceSeconds) {
+			want = c.fallbackDir;
+		}
+		g_arrowSent[a] = want;
+		mask |= want;
+	}
+
+	if (g_swipePressed && now - g_swipeTime >= kSwipeHoldSeconds)
+		g_swipePressed = 0;
+	mask |= g_swipePressed;
+
+	ApplyLocked(mask);
+}
+
+static bool ActiveLocked(double now) {
+	return g_enabled && now - g_lastTick < kActiveTimeout;
+}
+
+void Configure(const int faceBits[FACE_COUNT], const ArrowCfg *arrows, int arrowCount) {
+	std::lock_guard<std::mutex> guard(g_lock);
+	ResetLocked();
+	for (int i = 0; i < FACE_COUNT; i++) {
+		g_faceBit[i] = faceBits[i];
+		g_faceRect[i] = Rect();
+	}
+	g_arrowCount = std::min(arrowCount, (int)ARROW_COUNT);
+	for (int i = 0; i < g_arrowCount; i++) {
+		g_arrowCfg[i] = arrows[i];
+		g_arrowRect[i] = Rect();
+	}
+	g_swipeRect = Rect();
+	g_enabled = true;
+}
+
+void Disable() {
+	std::lock_guard<std::mutex> guard(g_lock);
+	ResetLocked();
+	g_enabled = false;
+}
+
+static Rect ToRect(const Bounds &b) {
+	Rect r;
+	r.x = b.x; r.y = b.y; r.w = b.w; r.h = b.h;
+	return r;
+}
+
+void SetFaceRect(int i, const Bounds &b) { std::lock_guard<std::mutex> guard(g_lock); g_faceRect[i] = ToRect(b); }
+void SetArrowRect(int i, const Bounds &b) { std::lock_guard<std::mutex> guard(g_lock); g_arrowRect[i] = ToRect(b); }
+void SetSwipeRect(const Bounds &b) { std::lock_guard<std::mutex> guard(g_lock); g_swipeRect = ToRect(b); }
+
+// Appele a chaque image de jeu (ecran de jeu au premier plan) : minuteries + signal d'activite.
+void Tick() {
+	std::lock_guard<std::mutex> guard(g_lock);
+	const double now = time_now_d();
+	if (g_enabled && now - g_lastTick >= kActiveTimeout)
+		ResetLocked();  // retour de pause : on repart d'un etat propre
+	g_lastTick = now;
+	if (g_enabled)
+		RecomputeLocked(now);
+}
+
+void HandleTouch(const TouchInput &input) {
+	std::lock_guard<std::mutex> guard(g_lock);
+	const double now = time_now_d();
+	if (!ActiveLocked(now))
+		return;
+	if (input.flags & TouchInputFlags::RELEASE_ALL) {
+		ResetLocked();
+		return;
+	}
+	if (input.flags & TouchInputFlags::MOUSE)
+		return;
+	const int id = input.id;
+	if (id < 0 || id >= TOUCH_MAX_POINTERS)
+		return;
+
+	if (input.flags & TouchInputFlags::DOWN) {
+		g_ptrDown[id] = true;
+		g_ptrZone[id] = ZoneAtLocked(input.x, input.y);
+		g_swipeActive[id] = g_swipeRect.Contains(input.x, input.y);
+		g_swipeFired[id] = false;
+		g_swipeStartX[id] = input.x;
+	}
+	if ((input.flags & TouchInputFlags::MOVE) && g_ptrDown[id]) {
+		g_ptrZone[id] = ZoneAtLocked(input.x, input.y);
+		if (g_swipeActive[id] && !g_swipeFired[id]) {
+			const float dx = input.x - g_swipeStartX[id];
+			if (fabsf(dx) >= g_swipeRect.w * 0.08f) {
+				g_swipeFired[id] = true;
+				if (!g_swipePressed) {
+					g_swipePressed = dx < 0 ? CTRL_LEFT : CTRL_RIGHT;
+					g_swipeTime = now;
+				}
+			}
+		}
+	}
+	if (input.flags & (TouchInputFlags::UP | TouchInputFlags::CANCEL)) {
+		g_ptrDown[id] = false;
+		g_ptrZone[id] = ZONE_NONE;
+		g_swipeActive[id] = false;
+	}
+	RecomputeLocked(now);
+}
+
+bool FaceDown(int i) { std::lock_guard<std::mutex> guard(g_lock); return g_faceDown[i]; }
+bool ArrowDown(int i) { std::lock_guard<std::mutex> guard(g_lock); return g_arrowDown[i]; }
+
+}  // namespace DivaFast
+
+void DivaFast_HandleTouch(const TouchInput &touch) {
+	DivaFast::HandleTouch(touch);
+}
+
+// Bouton du bas (dessin seulement).
+class DivaZone : public GamepadComponent {
 public:
-	DivaZone(int bit, std::string_view key, ImageID symbol, uint32_t color, float angle, UI::LayoutParams *lp)
-		: PSPButton(bit, key, ImageID("I_RECT"), ImageID("I_RECT"), symbol, 1.0f, lp), symbol_(symbol), color_(color), angle_(angle) {}
+	DivaZone(int index, std::string_view key, ImageID symbol, uint32_t color, UI::LayoutParams *lp)
+		: GamepadComponent(key, lp), index_(index), symbol_(symbol), color_(color) {}
 	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override { w = 0.0f; h = 0.0f; }
+	bool Touch(const TouchInput &input) override { GamepadComponent::Touch(input); return false; }
 	void Draw(UIContext &dc) override {
+		DivaFast::SetFaceRect(index_, bounds_);
 		const float a = std::max(g_gamepadOpacity, 0.2f);
-		const bool down = IsDownByTouch();
-		Bounds inner(bounds_.x + 2.0f, bounds_.y + 2.0f, bounds_.w - 4.0f, bounds_.h - 4.0f);
-		dc.FillRect(UI::Drawable(colorAlpha(color_, a * (down ? 0.9f : 0.45f))), inner);
+		const bool down = DivaFast::FaceDown(index_);
+		const float m = 2.0f;  // fine separation entre les zones
+		Bounds inner(bounds_.x + m, bounds_.y + m, bounds_.w - 2 * m, bounds_.h - 2 * m);
+		dc.FillRect(UI::Drawable(colorAlpha(color_, a * (down ? 0.9f : 0.35f))), inner);
 		const AtlasImage *img = dc.Draw()->GetAtlas()->getImage(symbol_);
 		if (img) {
 			float s = 0.5f * std::min(bounds_.w, bounds_.h) / std::max(img->w, img->h);
-			dc.Draw()->DrawImageRotated(symbol_, bounds_.centerX(), bounds_.centerY(), s, angle_, colorAlpha(0xFFFFFF, a));
+			dc.Draw()->DrawImageRotated(symbol_, bounds_.centerX(), bounds_.centerY(), s, 0.0f, colorAlpha(0xFFFFFF, a));
 		}
 	}
-	bool Touch(const TouchInput &input) override;
-	void AddListener(DivaArrowZone *z) { listeners_.push_back(z); }
 private:
+	int index_;
 	ImageID symbol_;
 	uint32_t color_;
-	float angle_;
-	std::vector<DivaArrowZone *> listeners_;
 };
 
-// Zone de fleches fusionnee : envoie pairDir si pairFace est tenu en meme temps,
-// sinon fallbackDir (seule = navigation dans les menus).
-class DivaArrowZone : public MultiTouchButton {
+// Zone de fleches fusionnee (dessin seulement).
+class DivaArrowZone : public GamepadComponent {
 public:
-	struct Arrow { int dir; uint32_t color; float angle; };
-	DivaArrowZone(std::string_view key, DivaZone *pairFace, DivaZone *otherFace, int pairDir, int fallbackDir,
-		Arrow top, Arrow bottom, UI::LayoutParams *lp)
-		: MultiTouchButton(key, ImageID("I_RECT"), ImageID("I_RECT"), ImageID("I_ARROW"), 1.0f, lp),
-		  pairFace_(pairFace), otherFace_(otherFace), pairDir_(pairDir), fallbackDir_(fallbackDir), top_(top), bottom_(bottom) {}
+	struct Arrow { uint32_t color; float angle; };
+	DivaArrowZone(int index, std::string_view key, Arrow top, Arrow bottom, UI::LayoutParams *lp)
+		: GamepadComponent(key, lp), index_(index), top_(top), bottom_(bottom) {}
 	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override { w = 0.0f; h = 0.0f; }
-	bool Touch(const TouchInput &input) override {
-		bool r = MultiTouchButton::Touch(input);
-		Evaluate();
-		return r;
-	}
-	void Update() override {
-		MultiTouchButton::Update();
-		Evaluate();
-	}
-	void Evaluate() {
-		const bool zoneDown = pointerDownMask_ != 0;
-		if (!zoneDown) {
-			if (sent_) {
-				__CtrlUpdateButtons(0, sent_);
-				sent_ = 0;
-			}
-			wasDown_ = false;
-			return;
-		}
-		if (!wasDown_) {
-			downTime_ = time_now_d();
-			wasDown_ = true;
-		}
-		int want = sent_;
-		if (pairFace_->IsDownByTouch() || sent_ == pairDir_) {
-			want = pairDir_;  // la combinaison reste prioritaire tant que le doigt est pose
-		} else if (otherFace_->IsDownByTouch() || time_now_d() - downTime_ >= kGraceSeconds) {
-			want = fallbackDir_;
-		}
-		if (want != sent_) {
-			if (sent_)
-				__CtrlUpdateButtons(0, sent_);
-			__CtrlUpdateButtons(want, 0);
-			sent_ = want;
-		}
-	}
+	bool Touch(const TouchInput &input) override { GamepadComponent::Touch(input); return false; }
 	void Draw(UIContext &dc) override {
+		DivaFast::SetArrowRect(index_, bounds_);
 		const float a = std::max(g_gamepadOpacity, 0.2f);
 		const float m = 2.0f;
 		const float half = bounds_.h * 0.5f;
 		Bounds topB(bounds_.x + m, bounds_.y + m, bounds_.w - 2 * m, half - m);
 		Bounds botB(bounds_.x + m, bounds_.y + half, bounds_.w - 2 * m, half - m);
-		dc.FillRect(UI::Drawable(colorAlpha(top_.color, a * (sent_ == top_.dir ? 0.9f : 0.45f))), topB);
-		dc.FillRect(UI::Drawable(colorAlpha(bottom_.color, a * (sent_ == bottom_.dir ? 0.9f : 0.45f))), botB);
+		dc.FillRect(UI::Drawable(colorAlpha(top_.color, a * 0.45f)), topB);
+		dc.FillRect(UI::Drawable(colorAlpha(bottom_.color, a * 0.45f)), botB);
+		if (DivaFast::ArrowDown(index_)) {
+			// Toute la zone s'allume en blanc transparent quand on appuie.
+			Bounds allB(bounds_.x + m, bounds_.y + m, bounds_.w - 2 * m, bounds_.h - 2 * m);
+			dc.FillRect(UI::Drawable(colorAlpha(0xFFFFFF, 0.35f)), allB);
+		}
 		const ImageID arrow("I_ARROW");
 		const AtlasImage *img = dc.Draw()->GetAtlas()->getImage(arrow);
 		if (img) {
@@ -1089,28 +1280,28 @@ public:
 		}
 		dc.SetFontStyle(dc.GetTheme().uiFont);
 		dc.SetFontScale(1.5f, 1.5f);
-		dc.DrawTextShadow("OR", bounds_.centerX(), bounds_.centerY(), colorAlpha(0xFFFFFF, a), ALIGN_CENTER);
+		// Police de l'atlas (pas de rendu de texte systeme a chaque image).
+		dc.DrawText("OR", bounds_.centerX(), bounds_.centerY(), colorAlpha(0xFFFFFF, a), ALIGN_CENTER | FLAG_DYNAMIC_ASCII);
 		dc.SetFontScale(1.0f, 1.0f);
 	}
 private:
-	static constexpr double kGraceSeconds = 0.06;  // temps laisse pour poser le 2e doigt
-	DivaZone *pairFace_;
-	DivaZone *otherFace_;
-	int pairDir_;
-	int fallbackDir_;
+	int index_;
 	Arrow top_;
 	Arrow bottom_;
-	int sent_ = 0;
-	bool wasDown_ = false;
-	double downTime_ = 0.0;
 };
 
-bool DivaZone::Touch(const TouchInput &input) {
-	bool r = PSPButton::Touch(input);
-	for (auto *z : listeners_)
-		z->Evaluate();
-	return r;
-}
+// Zone de glissement sur l'ecran du jeu (invisible). Fait aussi tourner les minuteries.
+class DivaSwipeZone : public GamepadComponent {
+public:
+	DivaSwipeZone(std::string_view key, UI::LayoutParams *lp) : GamepadComponent(key, lp) {}
+	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override { w = 0.0f; h = 0.0f; }
+	bool Touch(const TouchInput &input) override { GamepadComponent::Touch(input); return false; }
+	void Draw(UIContext &dc) override { DivaFast::SetSwipeRect(bounds_); }
+	void Update() override {
+		GamepadComponent::Update();
+		DivaFast::Tick();
+	}
+};
 
 UI::ViewGroup *CreatePadLayout(const TouchControlConfig &config, float xres, float yres, bool *pause, ControlMapper *controlMapper) {
 	using namespace UI;
@@ -1197,38 +1388,41 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 		const float ox = (xres - fullW) * 0.5f;
 		const float oy = (yres - fullH) * 0.5f;
 		const float gameH = fullH * 0.70f;
-		const float gameW = gameH * 480.0f / 272.0f;
+		// Etirement horizontal leger (25%) pour affiner les zones laterales.
+		const float gameW = std::min(gameH * 480.0f / 272.0f * 1.25f, fullW);
 		const float padW = std::max((fullW - gameW) * 0.5f, 0.0f);
 		const float btnH = fullH - gameH;
 		const float btnW = fullW / 4.0f;
 		struct Zone { int bit; const char *key; const char *img; uint32_t color; };
-		const Zone btn[4] = {
+		const Zone btn[DivaFast::FACE_COUNT] = {
 			{ CTRL_TRIANGLE, "Diva triangle", "I_TRIANGLE", 0x60D040 },
 			{ CTRL_SQUARE,   "Diva square",   "I_SQUARE",   0xC060FF },
 			{ CTRL_CROSS,    "Diva cross",    "I_CROSS",    0xFF9040 },
 			{ CTRL_CIRCLE,   "Diva circle",   "I_CIRCLE",   0x4040FF },
 		};
-		DivaZone *face[4];
-		for (int i = 0; i < 4; i++) {
-			face[i] = Add(new DivaZone(btn[i].bit, btn[i].key, ImageID(btn[i].img), btn[i].color, 0.0f,
+		enum { TRIANGLE = 0, SQUARE = 1, CROSS = 2, CIRCLE = 3 };
+		int faceBits[DivaFast::FACE_COUNT];
+		for (int i = 0; i < DivaFast::FACE_COUNT; i++) {
+			faceBits[i] = btn[i].bit;
+			Add(new DivaZone(i, btn[i].key, ImageID(btn[i].img), btn[i].color,
 				new AnchorLayoutParams(btnW, btnH, ox + btnW * i, oy + gameH, NONE, NONE)));
 		}
-		DivaZone *triangle = face[0], *square = face[1], *cross = face[2], *circle = face[3];
+		// Gauche : rond -> droite, sinon bas. Droite : carre -> gauche, sinon haut.
+		const DivaFast::ArrowCfg arrows[DivaFast::ARROW_COUNT] = {
+			{ CIRCLE, CROSS, CTRL_RIGHT, CTRL_DOWN },
+			{ SQUARE, TRIANGLE, CTRL_LEFT, CTRL_UP },
+		};
+		DivaFast::Configure(faceBits, arrows, padW > 0.0f ? DivaFast::ARROW_COUNT : 0);
 		if (padW > 0.0f) {
 			const float PI_F = (float)M_PI;
-			// Gauche : rond -> droite, sinon bas
-			DivaArrowZone *left = Add(new DivaArrowZone("Diva left zone", circle, cross, CTRL_RIGHT, CTRL_DOWN,
-				{ CTRL_RIGHT, 0x4040FF, PI_F }, { CTRL_DOWN, 0xFF9040, PI_F * 1.5f },
+			Add(new DivaArrowZone(0, "Diva left zone", { 0x4040FF, PI_F }, { 0xFF9040, PI_F * 1.5f },
 				new AnchorLayoutParams(padW, gameH, ox, oy, NONE, NONE)));
-			// Droite : carre -> gauche, sinon haut
-			DivaArrowZone *right = Add(new DivaArrowZone("Diva right zone", square, triangle, CTRL_LEFT, CTRL_UP,
-				{ CTRL_UP, 0x60D040, PI_F * 0.5f }, { CTRL_LEFT, 0xC060FF, 0.0f },
+			Add(new DivaArrowZone(1, "Diva right zone", { 0x60D040, PI_F * 0.5f }, { 0xC060FF, 0.0f },
 				new AnchorLayoutParams(padW, gameH, ox + fullW - padW, oy, NONE, NONE)));
-			circle->AddListener(left);
-			cross->AddListener(left);
-			square->AddListener(right);
-			triangle->AddListener(right);
 		}
+		Add(new DivaSwipeZone("Diva swipe", new AnchorLayoutParams(gameW, gameH, ox + padW, oy, NONE, NONE)));
+	} else {
+		DivaFast::Disable();
 	}
 
 	// touchActionButtonCenter.show will always be true, since that's the default.

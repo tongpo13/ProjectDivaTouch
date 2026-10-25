@@ -430,3 +430,6 @@ void GamepadTouch();
 void GamepadResetTouch();
 void GamepadUpdateOpacity(float force = -1.0f);
 float GamepadGetOpacity();
+
+// Mode Diva : traitement direct du tactile (appele depuis NativeTouch).
+void DivaFast_HandleTouch(const TouchInput &touch);

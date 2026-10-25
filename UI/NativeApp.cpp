@@ -66,6 +66,7 @@
 #include "Common/GPU/thin3d.h"
 #include "Common/GPU/Vulkan/FixedSPIRVCache.h"
 #include "Common/UI/UI.h"
+#include "UI/GamepadEmu.h"
 #include "Common/UI/Screen.h"
 #include "Common/UI/ScreenManager.h"
 #include "Common/UI/Context.h"
@@ -1537,6 +1538,9 @@ void NativeTouch(const TouchInput &touch) {
 	if (my_isnan(touch.x) || my_isnan(touch.y)) {
 		return;
 	}
+
+	// Mode Diva : les zones tactiles reagissent tout de suite, sans attendre la file.
+	DivaFast_HandleTouch(touch);
 
 	QueuedEvent ev{};
 	ev.type = QueuedEventType::TOUCH;
