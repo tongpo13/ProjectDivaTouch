@@ -999,6 +999,8 @@ void InitPadLayout(TouchControlConfig *config, DeviceOrientation orientation, fl
 }
 
 // ===== Mode Diva : zones tactiles rectangulaires =====
+class DivaArrowZone;
+
 class DivaZone : public PSPButton {
 public:
 	DivaZone(int bit, std::string_view key, ImageID symbol, uint32_t color, float angle, UI::LayoutParams *lp)
@@ -1015,11 +1017,100 @@ public:
 			dc.Draw()->DrawImageRotated(symbol_, bounds_.centerX(), bounds_.centerY(), s, angle_, colorAlpha(0xFFFFFF, a));
 		}
 	}
+	bool Touch(const TouchInput &input) override;
+	void AddListener(DivaArrowZone *z) { listeners_.push_back(z); }
 private:
 	ImageID symbol_;
 	uint32_t color_;
 	float angle_;
+	std::vector<DivaArrowZone *> listeners_;
 };
+
+// Zone de fleches fusionnee : envoie pairDir si pairFace est tenu en meme temps,
+// sinon fallbackDir (seule = navigation dans les menus).
+class DivaArrowZone : public MultiTouchButton {
+public:
+	struct Arrow { int dir; uint32_t color; float angle; };
+	DivaArrowZone(std::string_view key, DivaZone *pairFace, DivaZone *otherFace, int pairDir, int fallbackDir,
+		Arrow top, Arrow bottom, UI::LayoutParams *lp)
+		: MultiTouchButton(key, ImageID("I_RECT"), ImageID("I_RECT"), ImageID("I_ARROW"), 1.0f, lp),
+		  pairFace_(pairFace), otherFace_(otherFace), pairDir_(pairDir), fallbackDir_(fallbackDir), top_(top), bottom_(bottom) {}
+	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override { w = 0.0f; h = 0.0f; }
+	bool Touch(const TouchInput &input) override {
+		bool r = MultiTouchButton::Touch(input);
+		Evaluate();
+		return r;
+	}
+	void Update() override {
+		MultiTouchButton::Update();
+		Evaluate();
+	}
+	void Evaluate() {
+		const bool zoneDown = pointerDownMask_ != 0;
+		if (!zoneDown) {
+			if (sent_) {
+				__CtrlUpdateButtons(0, sent_);
+				sent_ = 0;
+			}
+			wasDown_ = false;
+			return;
+		}
+		if (!wasDown_) {
+			downTime_ = time_now_d();
+			wasDown_ = true;
+		}
+		int want = sent_;
+		if (pairFace_->IsDownByTouch() || sent_ == pairDir_) {
+			want = pairDir_;  // la combinaison reste prioritaire tant que le doigt est pose
+		} else if (otherFace_->IsDownByTouch() || time_now_d() - downTime_ >= kGraceSeconds) {
+			want = fallbackDir_;
+		}
+		if (want != sent_) {
+			if (sent_)
+				__CtrlUpdateButtons(0, sent_);
+			__CtrlUpdateButtons(want, 0);
+			sent_ = want;
+		}
+	}
+	void Draw(UIContext &dc) override {
+		const float a = std::max(g_gamepadOpacity, 0.2f);
+		const float m = 2.0f;
+		const float half = bounds_.h * 0.5f;
+		Bounds topB(bounds_.x + m, bounds_.y + m, bounds_.w - 2 * m, half - m);
+		Bounds botB(bounds_.x + m, bounds_.y + half, bounds_.w - 2 * m, half - m);
+		dc.FillRect(UI::Drawable(colorAlpha(top_.color, a * (sent_ == top_.dir ? 0.9f : 0.45f))), topB);
+		dc.FillRect(UI::Drawable(colorAlpha(bottom_.color, a * (sent_ == bottom_.dir ? 0.9f : 0.45f))), botB);
+		const ImageID arrow("I_ARROW");
+		const AtlasImage *img = dc.Draw()->GetAtlas()->getImage(arrow);
+		if (img) {
+			float s = 0.4f * std::min(bounds_.w, half) / std::max(img->w, img->h);
+			dc.Draw()->DrawImageRotated(arrow, bounds_.centerX(), bounds_.y + half * 0.45f, s, top_.angle, colorAlpha(0xFFFFFF, a));
+			dc.Draw()->DrawImageRotated(arrow, bounds_.centerX(), bounds_.y + half * 1.55f, s, bottom_.angle, colorAlpha(0xFFFFFF, a));
+		}
+		dc.SetFontStyle(dc.GetTheme().uiFont);
+		dc.SetFontScale(1.5f, 1.5f);
+		dc.DrawTextShadow("OR", bounds_.centerX(), bounds_.centerY(), colorAlpha(0xFFFFFF, a), ALIGN_CENTER);
+		dc.SetFontScale(1.0f, 1.0f);
+	}
+private:
+	static constexpr double kGraceSeconds = 0.06;  // temps laisse pour poser le 2e doigt
+	DivaZone *pairFace_;
+	DivaZone *otherFace_;
+	int pairDir_;
+	int fallbackDir_;
+	Arrow top_;
+	Arrow bottom_;
+	int sent_ = 0;
+	bool wasDown_ = false;
+	double downTime_ = 0.0;
+};
+
+bool DivaZone::Touch(const TouchInput &input) {
+	bool r = PSPButton::Touch(input);
+	for (auto *z : listeners_)
+		z->Evaluate();
+	return r;
+}
 
 UI::ViewGroup *CreatePadLayout(const TouchControlConfig &config, float xres, float yres, bool *pause, ControlMapper *controlMapper) {
 	using namespace UI;
@@ -1097,7 +1188,7 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 	}
 
 	// Mode Diva (paysage) : jeu en haut au centre (70% de la hauteur),
-	// 2 fleches a gauche, 2 fleches a droite, 4 boutons sur les 30% du bas.
+	// zone fleches fusionnee a gauche et a droite, 4 boutons sur les 30% du bas.
 	const bool divaMode = xres > yres;
 	if (divaMode) {
 		// Coordonnees ecran complet (on ignore les marges de l'encoche).
@@ -1108,29 +1199,35 @@ GamepadEmuView::GamepadEmuView(const TouchControlConfig &config, float xres, flo
 		const float gameH = fullH * 0.70f;
 		const float gameW = gameH * 480.0f / 272.0f;
 		const float padW = std::max((fullW - gameW) * 0.5f, 0.0f);
-		const float padH = gameH * 0.5f;
 		const float btnH = fullH - gameH;
 		const float btnW = fullW / 4.0f;
-		struct Zone { int bit; const char *key; const char *img; uint32_t color; float angle; float x; float y; };
-		const Zone pad[4] = {
-			{ CTRL_RIGHT, "Diva right", "I_ARROW", 0x4040FF, (float)M_PI,         0.0f,         0.0f },
-			{ CTRL_DOWN,  "Diva down",  "I_ARROW", 0xFF9040, (float)(M_PI * 1.5), 0.0f,         padH },
-			{ CTRL_UP,    "Diva up",    "I_ARROW", 0x60D040, (float)(M_PI * 0.5), fullW - padW, 0.0f },
-			{ CTRL_LEFT,  "Diva left",  "I_ARROW", 0xC060FF, 0.0f,                fullW - padW, padH },
-		};
+		struct Zone { int bit; const char *key; const char *img; uint32_t color; };
 		const Zone btn[4] = {
-			{ CTRL_TRIANGLE, "Diva triangle", "I_TRIANGLE", 0x60D040, 0.0f, 0.0f, 0.0f },
-			{ CTRL_SQUARE,   "Diva square",   "I_SQUARE",   0xC060FF, 0.0f, 0.0f, 0.0f },
-			{ CTRL_CROSS,    "Diva cross",    "I_CROSS",    0xFF9040, 0.0f, 0.0f, 0.0f },
-			{ CTRL_CIRCLE,   "Diva circle",   "I_CIRCLE",   0x4040FF, 0.0f, 0.0f, 0.0f },
+			{ CTRL_TRIANGLE, "Diva triangle", "I_TRIANGLE", 0x60D040 },
+			{ CTRL_SQUARE,   "Diva square",   "I_SQUARE",   0xC060FF },
+			{ CTRL_CROSS,    "Diva cross",    "I_CROSS",    0xFF9040 },
+			{ CTRL_CIRCLE,   "Diva circle",   "I_CIRCLE",   0x4040FF },
 		};
+		DivaZone *face[4];
 		for (int i = 0; i < 4; i++) {
-			if (padW > 0.0f) {
-				Add(new DivaZone(pad[i].bit, pad[i].key, ImageID(pad[i].img), pad[i].color, pad[i].angle,
-					new AnchorLayoutParams(padW, padH, ox + pad[i].x, oy + pad[i].y, NONE, NONE)));
-			}
-			Add(new DivaZone(btn[i].bit, btn[i].key, ImageID(btn[i].img), btn[i].color, btn[i].angle,
+			face[i] = Add(new DivaZone(btn[i].bit, btn[i].key, ImageID(btn[i].img), btn[i].color, 0.0f,
 				new AnchorLayoutParams(btnW, btnH, ox + btnW * i, oy + gameH, NONE, NONE)));
+		}
+		DivaZone *triangle = face[0], *square = face[1], *cross = face[2], *circle = face[3];
+		if (padW > 0.0f) {
+			const float PI_F = (float)M_PI;
+			// Gauche : rond -> droite, sinon bas
+			DivaArrowZone *left = Add(new DivaArrowZone("Diva left zone", circle, cross, CTRL_RIGHT, CTRL_DOWN,
+				{ CTRL_RIGHT, 0x4040FF, PI_F }, { CTRL_DOWN, 0xFF9040, PI_F * 1.5f },
+				new AnchorLayoutParams(padW, gameH, ox, oy, NONE, NONE)));
+			// Droite : carre -> gauche, sinon haut
+			DivaArrowZone *right = Add(new DivaArrowZone("Diva right zone", square, triangle, CTRL_LEFT, CTRL_UP,
+				{ CTRL_UP, 0x60D040, PI_F * 0.5f }, { CTRL_LEFT, 0xC060FF, 0.0f },
+				new AnchorLayoutParams(padW, gameH, ox + fullW - padW, oy, NONE, NONE)));
+			circle->AddListener(left);
+			cross->AddListener(left);
+			square->AddListener(right);
+			triangle->AddListener(right);
 		}
 	}
 
